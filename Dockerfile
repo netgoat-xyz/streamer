@@ -12,7 +12,7 @@ RUN bun build --compile --minify --sourcemap=none server.ts --outfile /out/strea
 FROM alpine:3.21
 LABEL org.opencontainers.image.description="Minimal hardened NetGoat stream server runtime" \
       org.opencontainers.image.base.name="alpine:3.21"
-RUN apk add --no-cache ca-certificates \
+RUN apk add --no-cache ca-certificates libstdc++ libgcc \
   && adduser -D -H -s /sbin/nologin -u 10001 stream \
   && rm -rf /var/cache/apk/* /tmp/*
 WORKDIR /app
