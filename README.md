@@ -1,3 +1,5 @@
+<img width="2968" height="841" alt="NetGoat" src="assets/netgoat-banner.png" />
+
 # NetGoat stream server
 
 The stream server is NetGoat's small control plane. It reads domains, upstream
@@ -6,9 +8,36 @@ MongoDB, then exposes normalized snapshots for polling agents. If MongoDB is
 unavailable, the last in-memory snapshot remains active and startup can fall
 back to a local seed file.
 
-## Run it
+## Architecture
 
-Requirements: Bun 1.3 or newer and, optionally, MongoDB.
+```text
+dashboard / CAS ──writes──► MongoDB ◄──reads── stream server ──HTTP poll──► agents
+                                                    │
+                                                    └── seed-data.json (fallback)
+```
+
+Agents poll the stream server; the stream server never pushes to them. Every
+snapshot is derived from MongoDB on an interval (`POLL_INTERVAL`), so a write to
+MongoDB becomes visible to agents within one poll cycle. The service is
+read-mostly and stateless apart from its in-memory cache, so it can be restarted
+without losing data.
+
+## Stack
+
+| Layer | Choice |
+| --- | --- |
+| Runtime | Bun 1.3+ (compiled to a static binary for the image) |
+| Language | TypeScript 7, strict mode |
+| Database | MongoDB via Mongoose 8 |
+| Container | Alpine 3.21, non-root UID 10001 |
+| Tests | `bun test` |
+
+## Prerequisites
+
+- Bun 1.3 or newer
+- MongoDB 6 or newer (optional — the server serves cached or seed state without it)
+
+## Run it
 
 ```bash
 cp .env.example .env
@@ -23,6 +52,37 @@ version control.
 CAS is optional. Leave `casEnabled` unset or false in MongoDB and seed data to
 run the stream server without exposing a central administrative service signal
 to downstream consumers.
+
+## Scripts
+
+| Command | Purpose |
+| --- | --- |
+| `bun run start` | Run the server |
+| `bun run dev` | Run with `--watch` |
+| `bun run test` | Run the test suite |
+| `bun run typecheck` | `tsc --noEmit` |
+| `bun run scripts/seed-mongo.ts` | Upsert seed data into MongoDB |
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HOST` | `0.0.0.0` | Listen address |
+| `PORT` | `8787` | Listen port |
+| `MONGODB_URI` | `mongodb://localhost:27017` | MongoDB connection string |
+| `MONGODB_DB` | `netgoat` | Database name |
+| `POLL_INTERVAL` | `5000` | Snapshot rebuild interval, ms |
+| `MONGO_RETRY_INTERVAL` | `10000` | Reconnect backoff, ms |
+| `API_KEY` | empty | Read key (`X-API-Key` / `Authorization: Bearer`) |
+| `DIAMOND_KEY` | empty | Additional read key (`X-Diamond-Key`) |
+| `CONFIG_WRITE_KEY` | empty | Required for `PUT /agent-config` when set |
+| `ALLOW_UNAUTHENTICATED` | `false` | Serve reads without a key |
+| `CAS_ENABLED` | `false` | Advertise CAS to clients in snapshots |
+| `SEED_FILE` | `./seed-data.json` | Local fallback snapshot |
+| `LOG_LEVEL` | `info` | Log verbosity |
+
+Set at least one read key. `ALLOW_UNAUTHENTICATED=true` is only appropriate on a
+trusted loopback network.
 
 ## Authentication
 
@@ -44,6 +104,8 @@ header. Without it, write access falls back to the normal API authentication.
 | `GET` | `/users` | Active, non-banned control-plane users |
 | `GET` | `/agent-config` | Current normalized agent runtime settings |
 | `PUT` | `/agent-config` | Validate and update agent runtime settings |
+| `GET` | `/waf-stats` | Aggregated WAF counters |
+| `GET` | `/__netgoat/metrics` | Prometheus-style metrics |
 
 `/health` and `/domains` both include a `cas_enabled` boolean so clients can
 detect whether CAS should be surfaced in the UI or ignored entirely.
@@ -103,13 +165,48 @@ contains only `plugin_id`, `factory_id`, `version`, `sha256`, `api_version`,
 downloads, verifies, or executes plugin code. Agents must verify the pinned
 digest and enforce their own runtime and capability policies.
 
+## Docker
+
+```bash
+docker build -t netgoat-streamer .
+docker run --rm -p 8787:8787 --env-file .env netgoat-streamer
+```
+
+The image compiles the server to a single static binary with `bun build
+--compile`, runs on Alpine 3.21 as UID 10001, and healthchecks `/health`.
+Published images: `ghcr.io/netgoat-xyz/streamer`.
+
+## Deployment
+
+Run one or more replicas behind a load balancer. Each replica keeps its own
+in-memory cache and rebuilds it on `POLL_INTERVAL`, so scaling out is safe.
+Restrict the listener to the agent network and terminate TLS in front of it —
+the server speaks plain HTTP. Agents should send the read key on every request.
+
+## Security
+
+- Snapshots may contain TLS private keys; responses are `no-store` and must not
+  be cached by an intermediary.
+- Read keys and the config write key are compared without early exit.
+- Request bodies are size- and media-type-limited.
+- Report vulnerabilities per [SECURITY.md](SECURITY.md); do not open a public issue.
+
 ## Verification
 
 ```bash
-bun run test
+bun install --frozen-lockfile
 bun run typecheck
+bun test
 ```
 
 The test suite covers snapshot filtering and upstream mapping, seed conversion,
 request-size and media-type enforcement, secret redaction, model indexes,
 session expiry, invite lookup isolation, and DNS validation.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE).
