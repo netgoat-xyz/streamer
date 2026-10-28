@@ -6,7 +6,13 @@ const UserSchema = new mongoose.Schema({
   image: String,
   role: { type: String, default: "user" },
   banned: { type: Boolean, default: false },
-  
+
+  // Optional legacy agent credentials. They are never exposed by /users;
+  // the agent snapshot only becomes authoritative when explicit settings opt
+  // in and every active user has a credential hash.
+  password_hash: String,
+  zero_trust_enabled: { type: Boolean, default: true },
+
   experiments: [String],
   
   // Domain tracking

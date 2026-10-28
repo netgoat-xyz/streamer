@@ -21,7 +21,12 @@ interface SeedData {
   domains: PlainRecord[];
   waf_rules: PlainRecord[];
   users: PlainRecord[];
+  users_configured: boolean;
+  user_domains_configured: boolean;
+  plugins: PlainRecord;
+  plugins_configured: boolean;
   zero_trust_enabled: boolean;
+  cas_enabled: boolean;
   agent_config: PlainRecord;
 }
 
@@ -77,7 +82,12 @@ export function normalizeSeedData(value: unknown): SeedData {
     domains,
     waf_rules: wafRules,
     users,
+    users_configured: source.users_configured === true,
+    user_domains_configured: source.user_domains_configured === true,
+    plugins: asRecord(source.plugins),
+    plugins_configured: source.plugins_configured === true,
     zero_trust_enabled: source.zero_trust_enabled === true,
+    cas_enabled: source.cas_enabled === true,
     agent_config: asRecord(source.agent_config),
   };
 }
@@ -160,6 +170,11 @@ export async function main(): Promise<void> {
         {
           $set: {
             zeroTrustEnabled: data.zero_trust_enabled,
+            casEnabled: data.cas_enabled,
+            agentUsersConfigured: data.users_configured,
+            agentUserDomainsConfigured: data.user_domains_configured,
+            plugins: data.plugins,
+            pluginsConfigured: data.plugins_configured,
             agentConfig: data.agent_config,
             updatedAt: new Date(),
           },

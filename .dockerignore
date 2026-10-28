@@ -1,0 +1,9 @@
+.git
+**/.git
+node_modules
+.env
+.env.*
+*.md
+**/*.test.ts
+scripts/
+README.md

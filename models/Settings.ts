@@ -15,6 +15,20 @@ const SettingsSchema = new mongoose.Schema({
   dnsEnabled: { type: Boolean, default: true },
   reverseProxyEnabled: { type: Boolean, default: true },
   zeroTrustEnabled: { type: Boolean, default: false },
+  casEnabled: { type: Boolean, default: false },
+  // The agent can only replace its local users when the control plane makes
+  // that ownership explicit. These remain opt-in because dashboard users and
+  // agent login users may be managed independently.
+  agentUsersConfigured: { type: Boolean, default: false },
+  agentUserDomainsConfigured: { type: Boolean, default: false },
+  // Plugin deployment is independently authoritative. The stream server
+  // publishes a bounded, execution-free installation plan only when this flag
+  // is true; an explicit empty plan safely removes prior global installs.
+  pluginsConfigured: { type: Boolean, default: false },
+  plugins: {
+    type: mongoose.Schema.Types.Mixed,
+    default: () => ({ installations: [] }),
+  },
 
   userDomainLimit: { type: Number, default: 3 },
   dnsRecordLimit: { type: Number, default: 50 },

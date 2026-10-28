@@ -6,13 +6,6 @@ MongoDB, then exposes normalized snapshots for polling agents. If MongoDB is
 unavailable, the last in-memory snapshot remains active and startup can fall
 back to a local seed file.
 
-Dashboard writes (ProxyConfig upstreams, TLS PEMs, domain `waf_rules`, and
-`route_policy`) land in MongoDB. This service polls those documents and
-publishes `GET /domains` for the NetGoat agent. The agent-facing JSON field is
-**`policy`** (`cache` / `bandwidth`), not `route_policy`, so UI-managed route
-policy reaches the agent without YAML. Snapshot fields stay within the Go
-agent contract: `policy`, certs, targets, and `waf_rules`.
-
 ## Run it
 
 Requirements: Bun 1.3 or newer and, optionally, MongoDB.
@@ -26,6 +19,10 @@ bun run start
 The server retries an unavailable MongoDB connection; it does not need MongoDB
 to start. Keep `seed-data.json`, `.env`, TLS private keys, and API keys out of
 version control.
+
+CAS is optional. Leave `casEnabled` unset or false in MongoDB and seed data to
+run the stream server without exposing a central administrative service signal
+to downstream consumers.
 
 ## Authentication
 
@@ -43,10 +40,13 @@ header. Without it, write access falls back to the normal API authentication.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/` or `/health` | Liveness, Mongo status, and cached counts |
-| `GET` | `/domains` | Active routes, TLS PEMs, per-route `policy`, upstreams, WAF rules, zero-trust state, and agent settings |
+| `GET` | `/domains` | Active routes, upstreams, WAF rules, zero-trust state, agent settings, opted-in user snapshots, and global plugin deployment plans |
 | `GET` | `/users` | Active, non-banned control-plane users |
 | `GET` | `/agent-config` | Current normalized agent runtime settings |
 | `PUT` | `/agent-config` | Validate and update agent runtime settings |
+
+`/health` and `/domains` both include a `cas_enabled` boolean so clients can
+detect whether CAS should be surfaced in the UI or ignored entirely.
 
 All JSON responses are marked `Cache-Control: no-store` because snapshots can
 contain TLS private keys. Request bodies for configuration updates are limited
@@ -66,7 +66,12 @@ route no longer exists are omitted from the published snapshot.
   "domains": [],
   "waf_rules": [],
   "users": [],
+  "users_configured": false,
+  "user_domains_configured": false,
+  "plugins": { "installations": [] },
+  "plugins_configured": false,
   "zero_trust_enabled": false,
+  "cas_enabled": false,
   "agent_config": {}
 }
 ```
@@ -76,6 +81,28 @@ Run `bun run scripts/seed-mongo.ts` to upsert records. Setting
 collections. It never drops unrelated collections or deletes application user
 records.
 
+## Agent user snapshots
+
+The agent treats `users_configured` and `user_domains_configured` as explicit
+full-replacement signals. The stream server emits either signal only when the
+corresponding `Settings` flag (`agentUsersConfigured` or
+`agentUserDomainsConfigured`) is true. User replacement also requires every
+active source user to have a `password_hash`; this prevents dashboard-only
+users from accidentally replacing an agent's local login accounts. A flagged,
+empty list intentionally clears the matching agent collection. Without the
+flag, agents may upsert supplied records but retain local/offline data.
+
+## Global plugin deployments
+
+`plugins_configured` has the same explicit full-replacement semantics as the
+user snapshot flags. When true, the `plugins.installations` list is a complete
+global deployment plan; a true flag with an empty list removes previous global
+installs. Each installation is normalized and bounded before publication and
+contains only `plugin_id`, `factory_id`, `version`, `sha256`, `api_version`,
+`granted_capabilities`, and a JSON-object `config`. The stream server never
+downloads, verifies, or executes plugin code. Agents must verify the pinned
+digest and enforce their own runtime and capability policies.
+
 ## Verification
 
 ```bash
@@ -83,7 +110,6 @@ bun run test
 bun run typecheck
 ```
 
-The test suite covers snapshot filtering and upstream mapping, route `policy`
-emission from Mongo `route_policy`, seed conversion, request-size and media-type
-enforcement, secret redaction, model indexes, session expiry, invite lookup
-isolation, and DNS validation.
+The test suite covers snapshot filtering and upstream mapping, seed conversion,
+request-size and media-type enforcement, secret redaction, model indexes,
+session expiry, invite lookup isolation, and DNS validation.
