@@ -626,4 +626,29 @@ describe("parseWafStatName", () => {
     });
     expect(parseWafStatName("global")).toEqual({ name: "global", hosts: [] });
   });
+
+  test("uses the last host scope when several are present", () => {
+    expect(parseWafStatName("block admin [a.example.com] [b.example.com]")).toEqual({
+      name: "block admin [a.example.com]",
+      hosts: ["b.example.com"],
+    });
+  });
+
+  test("leaves a scope containing a closing bracket untouched", () => {
+    expect(parseWafStatName("zone [a] b]")).toEqual({ name: "zone [a] b]", hosts: [] });
+    expect(parseWafStatName("zone []")).toEqual({ name: "zone []", hosts: [] });
+    expect(parseWafStatName("[api.example.com]")).toEqual({
+      name: "[api.example.com]",
+      hosts: [],
+    });
+  });
+
+  test("stays linear on hostile unmatched brackets", () => {
+    // The previous /^(.*) \[([^\]]+)\]$/ pattern backtracked quadratically on
+    // this shape. 40k characters must return immediately, not in seconds.
+    const hostile = "x" + " [".repeat(20_000);
+    const started = performance.now();
+    expect(parseWafStatName(hostile)).toEqual({ name: hostile, hosts: [] });
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
 });

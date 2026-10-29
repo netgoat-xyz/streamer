@@ -1429,15 +1429,28 @@ export async function readJSONBody(request: Request): Promise<unknown> {
 
 export function parseWafStatName(name: string): { name: string; hosts: string[] } {
   const trimmed = name.trim();
-  const match = trimmed.match(/^(.*) \[([^\]]+)\]$/);
-  if (!match || !match[1] || !match[2]) {
+  // Parsed by hand rather than with /^(.*) \[([^\]]+)\]$/: that pattern
+  // backtracks over every " [" occurrence when the input does not match,
+  // which is quadratic on attacker-controlled rule names. lastIndexOf is
+  // linear and gives the same greedy "last bracket wins" result.
+  if (!trimmed.endsWith("]")) {
     return { name: trimmed, hosts: [] };
   }
-  const hosts = match[2]
+  const close = trimmed.length - 1;
+  const open = trimmed.lastIndexOf(" [", close);
+  if (open <= 0) {
+    return { name: trimmed, hosts: [] };
+  }
+  const base = trimmed.slice(0, open).trim();
+  const hostsPart = trimmed.slice(open + 2, close);
+  if (!base || !hostsPart || hostsPart.includes("]")) {
+    return { name: trimmed, hosts: [] };
+  }
+  const hosts = hostsPart
     .split(",")
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean);
-  return { name: match[1].trim(), hosts };
+  return { name: base, hosts };
 }
 
 export async function applyWafRuleStats(body: unknown): Promise<{ updated: number; persisted: boolean }> {
