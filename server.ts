@@ -7,34 +7,40 @@ import SettingsModel from "./models/Settings";
 import UserModel from "./models/User";
 import WAFRuleModel from "./models/WAFRule";
 
-interface RouteCachePolicy {
-  enabled?: boolean;
-  ttl_seconds?: number;
-  max_entries?: number;
-  max_body_bytes?: number;
-}
-
-interface RouteBandwidthPolicy {
-  enabled?: boolean;
-  bytes_per_second?: number;
-  burst_bytes?: number;
-  key?: AgentKeyMode;
-}
-
-/** Agent-facing per-route overrides (`policy.RoutePolicy`). Empty objects are omitted. */
-export interface RoutePolicy {
-  cache?: RouteCachePolicy;
-  bandwidth?: RouteBandwidthPolicy;
-}
-
 interface Subdomain {
   id: string;
   subdomain: string;
   full_domain: string;
   target_url: string;
   target_urls?: string[];
+  certificate_pem?: string;
+  private_key_pem?: string;
   policy?: RoutePolicy;
   active: boolean;
+}
+
+type RouteKeyMode = "ip" | "host" | "route" | "global";
+type AccessMode = "off" | "allowlist" | "blocklist";
+
+interface RouteAccess {
+  mode: AccessMode;
+  cidrs: string[];
+}
+
+interface RoutePolicy {
+  cache?: {
+    enabled?: boolean;
+    ttl_seconds?: number;
+    max_entries?: number;
+    max_body_bytes?: number;
+  };
+  bandwidth?: {
+    enabled?: boolean;
+    bytes_per_second?: number;
+    burst_bytes?: number;
+    key?: RouteKeyMode;
+  };
+  access?: RouteAccess;
 }
 
 interface Domain {
@@ -44,8 +50,8 @@ interface Domain {
   target_urls?: string[];
   certificate_pem?: string;
   private_key_pem?: string;
-  policy?: RoutePolicy;
   team_id?: string;
+  policy?: RoutePolicy;
   active: boolean;
   subdomains: Subdomain[];
 }
@@ -67,6 +73,45 @@ interface User {
   role?: string;
 }
 
+// AgentUser contains the credentials required by the agent's local login
+// database. It is intentionally distinct from the public control-plane user
+// representation served by /users.
+interface AgentUser {
+  id: string;
+  username: string;
+  email: string;
+  password_hash: string;
+  zero_trust_enabled: boolean;
+}
+
+interface UserDomain {
+  id: string;
+  user_id: string;
+  username: string;
+  domain: string;
+  target_url: string;
+  active: boolean;
+}
+
+/**
+ * PluginInstallation is deliberately an execution-free deployment plan. The
+ * agent is responsible for verifying the pinned digest and deciding whether a
+ * factory and API version are supported before it ever loads anything.
+ */
+export interface PluginInstallation {
+  plugin_id: string;
+  factory_id: string;
+  version: string;
+  sha256: string;
+  api_version: string;
+  granted_capabilities: string[];
+  config: Record<string, unknown>;
+}
+
+export interface PluginsConfig {
+  installations: PluginInstallation[];
+}
+
 type AgentKeyMode = "ip" | "host" | "route" | "global";
 
 interface AgentToggle {
@@ -79,6 +124,22 @@ interface AgentModelConfig extends AgentToggle {
   scaler_path: string;
   python_script: string;
   feature_header: string;
+}
+
+interface AgentDynamicRule {
+  name: string;
+  language: "typescript" | "javascript";
+  source: string;
+}
+
+interface AgentDynamicRulesConfig extends AgentToggle {
+  rules: AgentDynamicRule[];
+  max_rules: number;
+  max_source_bytes: number;
+  max_compiled_bytes: number;
+  max_input_bytes: number;
+  max_result_bytes: number;
+  max_execution_milliseconds: number;
 }
 
 interface AgentConfig {
@@ -107,6 +168,7 @@ interface AgentConfig {
   };
   koda_waf: AgentModelConfig;
   koda_2: AgentModelConfig;
+  dynamic_rules: AgentDynamicRulesConfig;
 }
 
 type AgentConfigInput = Partial<Record<keyof AgentConfig, Record<string, unknown>>>;
@@ -114,7 +176,16 @@ type AgentConfigInput = Partial<Record<keyof AgentConfig, Record<string, unknown
 interface DomainsResponse {
   domains: Domain[];
   waf_rules: WafRule[];
+  users: AgentUser[];
+  users_configured: boolean;
+  user_domains: UserDomain[];
+  user_domains_configured: boolean;
+  plugins: PluginsConfig;
+  // plugins_configured is an explicit full-replacement signal. Older control
+  // planes that omit it must never cause an agent to remove installed plugins.
+  plugins_configured: boolean;
   zero_trust_enabled: boolean;
+  cas_enabled: boolean;
   agent_config: AgentConfig;
 }
 
@@ -122,7 +193,14 @@ export interface CachedState {
   domains: Domain[];
   waf_rules: WafRule[];
   users: User[];
+  agent_users: AgentUser[];
+  users_configured: boolean;
+  user_domains: UserDomain[];
+  user_domains_configured: boolean;
+  plugins: PluginsConfig;
+  plugins_configured: boolean;
   zero_trust_enabled: boolean;
+  cas_enabled: boolean;
   agent_config: AgentConfig;
   last_pulled: Date;
 }
@@ -147,6 +225,27 @@ const SEED_FILE = process.env.SEED_FILE || "./seed-data.json";
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const MAX_CONFIG_BODY_BYTES = 64 * 1024;
 const MAX_SEED_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_PLUGIN_INSTALLATIONS = 64;
+const MAX_PLUGIN_IDENTIFIER_LENGTH = 128;
+const MAX_PLUGIN_VERSION_LENGTH = 128;
+const MAX_PLUGIN_API_VERSION_LENGTH = 128;
+const MAX_PLUGIN_CONFIG_BYTES = 16 * 1024;
+const MAX_TOTAL_PLUGIN_CONFIG_BYTES = 256 * 1024;
+const MAX_PLUGIN_CONFIG_DEPTH = 12;
+const MAX_PLUGIN_CONFIG_COLLECTION_LENGTH = 128;
+const MAX_PLUGIN_CONFIG_KEY_LENGTH = 128;
+const MAX_PLUGIN_CONFIG_STRING_BYTES = 8 * 1024;
+const PLUGIN_SHA256 = /^[a-f0-9]{64}$/i;
+const PLUGIN_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/@-]*$/;
+const PLUGIN_FACTORY_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const PLUGIN_OPAQUE_VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
+const PLUGIN_API_VERSION = /^[A-Za-z0-9][A-Za-z0-9._/@-]*$/;
+const PLUGIN_CONFIG_KEY = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const PLUGIN_CAPABILITIES = new Set([
+  "request.read",
+  "route.read",
+  "response.write",
+]);
 
 const defaultAgentConfig: AgentConfig = {
   cache: {
@@ -192,6 +291,16 @@ const defaultAgentConfig: AgentConfig = {
     scaler_path: "ai/koda2_scaler.pkl",
     python_script: "ai/koda2_server.py",
     feature_header: "X-Koda2-Features",
+  },
+  dynamic_rules: {
+    enabled: false,
+    rules: [],
+    max_rules: 64,
+    max_source_bytes: 64 * 1024,
+    max_compiled_bytes: 256 * 1024,
+    max_input_bytes: 64 * 1024,
+    max_result_bytes: 4 * 1024,
+    max_execution_milliseconds: 25,
   },
 };
 
@@ -274,6 +383,20 @@ function safePath(value: unknown, fallback: string, maxLength = 256): string {
   return trimmed;
 }
 
+// Agent-side filesystem paths (models, scaler, executed Python entrypoints) must
+// stay relative and inside the agent's own directory. Without this, a holder of
+// the config-write key could point the agent at an arbitrary file to load or run.
+function safeAgentFilePath(value: unknown, fallback: string): string {
+  const candidate = safePath(value, fallback);
+  const normalized = candidate.replace(/\\/g, "/");
+  const isAbsolute = normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized);
+  const escapesRoot = normalized.split("/").some((segment) => segment === "..");
+  if (isAbsolute || escapesRoot || normalized.startsWith("~")) {
+    return fallback;
+  }
+  return normalized;
+}
+
 function safeMetricsPath(value: unknown, fallback: string): string {
   const path = safePath(value, fallback);
   return path.startsWith("/") && !path.includes("?") && !path.includes("#") ? path : fallback;
@@ -282,6 +405,56 @@ function safeMetricsPath(value: unknown, fallback: string): string {
 function safeHeader(value: unknown, fallback: string): string {
   const header = safePath(value, fallback, 128);
   return /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(header) ? header : fallback;
+}
+
+function normalizeDynamicRules(value: unknown, fallback: AgentDynamicRulesConfig): AgentDynamicRulesConfig {
+  const raw = value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const maxRules = clampInt(raw.max_rules, fallback.max_rules, 1, 64);
+  const maxSourceBytes = clampInt(raw.max_source_bytes, fallback.max_source_bytes, 1024, 64 * 1024);
+  const maxCompiledBytes = clampInt(raw.max_compiled_bytes, fallback.max_compiled_bytes, 1024, 256 * 1024);
+  const maxInputBytes = clampInt(raw.max_input_bytes, fallback.max_input_bytes, 1024, 64 * 1024);
+  const maxResultBytes = clampInt(raw.max_result_bytes, fallback.max_result_bytes, 64, 4 * 1024);
+  const maxExecutionMilliseconds = clampInt(
+    raw.max_execution_milliseconds,
+    fallback.max_execution_milliseconds,
+    1,
+    500,
+  );
+  const rules: AgentDynamicRule[] = [];
+  let totalSourceBytes = 0;
+  // Keep the serialized agent configuration comfortably below the request and
+  // polling response caps. The Go runtime independently enforces all limits.
+  const maxTotalSourceBytes = 48 * 1024;
+  for (const value of Array.isArray(raw.rules) ? raw.rules : []) {
+    if (rules.length >= maxRules) break;
+    const rule = value !== null && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+    const name = typeof rule.name === "string" ? rule.name.trim() : "";
+    const source = typeof rule.source === "string" ? rule.source : "";
+    const sourceBytes = Buffer.byteLength(source, "utf8");
+    if (!name || name.length > 128 || /[\u0000-\u001f\u007f]/.test(name) || !source.trim() ||
+      source.includes("\u0000") || sourceBytes > maxSourceBytes || totalSourceBytes + sourceBytes > maxTotalSourceBytes) {
+      continue;
+    }
+    const language = rule.language === "javascript" || rule.language === "js"
+      ? "javascript"
+      : "typescript";
+    rules.push({ name, language, source });
+    totalSourceBytes += sourceBytes;
+  }
+  return {
+    enabled: boolValue(raw.enabled, fallback.enabled),
+    rules,
+    max_rules: maxRules,
+    max_source_bytes: maxSourceBytes,
+    max_compiled_bytes: maxCompiledBytes,
+    max_input_bytes: maxInputBytes,
+    max_result_bytes: maxResultBytes,
+    max_execution_milliseconds: maxExecutionMilliseconds,
+  };
 }
 
 export function normalizeAgentConfig(input: unknown): AgentConfig {
@@ -320,19 +493,20 @@ export function normalizeAgentConfig(input: unknown): AgentConfig {
     koda_waf: {
       enabled: boolValue(raw.koda_waf?.enabled, base.koda_waf.enabled),
       threshold: clampFloat(raw.koda_waf?.threshold, base.koda_waf.threshold, 0.01, 1),
-      model_path: safePath(raw.koda_waf?.model_path, base.koda_waf.model_path),
-      scaler_path: safePath(raw.koda_waf?.scaler_path, base.koda_waf.scaler_path),
-      python_script: safePath(raw.koda_waf?.python_script, base.koda_waf.python_script),
+      model_path: safeAgentFilePath(raw.koda_waf?.model_path, base.koda_waf.model_path),
+      scaler_path: safeAgentFilePath(raw.koda_waf?.scaler_path, base.koda_waf.scaler_path),
+      python_script: safeAgentFilePath(raw.koda_waf?.python_script, base.koda_waf.python_script),
       feature_header: safeHeader(raw.koda_waf?.feature_header, base.koda_waf.feature_header),
     },
     koda_2: {
       enabled: boolValue(raw.koda_2?.enabled, base.koda_2.enabled),
       threshold: clampFloat(raw.koda_2?.threshold, base.koda_2.threshold, 0.01, 1),
-      model_path: safePath(raw.koda_2?.model_path, base.koda_2.model_path),
-      scaler_path: safePath(raw.koda_2?.scaler_path, base.koda_2.scaler_path),
-      python_script: safePath(raw.koda_2?.python_script, base.koda_2.python_script),
+      model_path: safeAgentFilePath(raw.koda_2?.model_path, base.koda_2.model_path),
+      scaler_path: safeAgentFilePath(raw.koda_2?.scaler_path, base.koda_2.scaler_path),
+      python_script: safeAgentFilePath(raw.koda_2?.python_script, base.koda_2.python_script),
       feature_header: safeHeader(raw.koda_2?.feature_header, base.koda_2.feature_header),
     },
+    dynamic_rules: normalizeDynamicRules(raw.dynamic_rules, base.dynamic_rules),
   };
 }
 
@@ -409,7 +583,14 @@ let cachedState: CachedState = {
   domains: [],
   waf_rules: [],
   users: [],
+  agent_users: [],
+  users_configured: false,
+  user_domains: [],
+  user_domains_configured: false,
+  plugins: { installations: [] },
+  plugins_configured: false,
   zero_trust_enabled: false,
+  cas_enabled: false,
   agent_config: cloneDefaultAgentConfig(),
   last_pulled: new Date(0),
 };
@@ -420,11 +601,18 @@ interface CachedResponseBodies {
   agentConfig: string;
 }
 
-function serializeCachedResponses(state: CachedState): CachedResponseBodies {
+export function serializeCachedResponses(state: CachedState): CachedResponseBodies {
   const domains: DomainsResponse = {
     domains: state.domains,
     waf_rules: state.waf_rules,
+    users: state.agent_users,
+    users_configured: state.users_configured,
+    user_domains: state.user_domains,
+    user_domains_configured: state.user_domains_configured,
+    plugins: state.plugins,
+    plugins_configured: state.plugins_configured,
     zero_trust_enabled: state.zero_trust_enabled,
+    cas_enabled: state.cas_enabled,
     agent_config: state.agent_config,
   };
   return {
@@ -461,7 +649,12 @@ async function loadSeedData(): Promise<CachedState> {
       userDocs: Array.isArray(parsed.users) ? parsed.users : [],
       settingsDoc: {
         zeroTrustEnabled: parsed.zero_trust_enabled === true,
+        casEnabled: parsed.cas_enabled === true,
         agentConfig: parsed.agent_config,
+        agentUsersConfigured: parsed.users_configured === true,
+        agentUserDomainsConfigured: parsed.user_domains_configured === true,
+        plugins: parsed.plugins,
+        pluginsConfigured: parsed.plugins_configured === true,
       },
     });
   } catch (err) {
@@ -475,7 +668,14 @@ function emptyState(): CachedState {
     domains: [],
     waf_rules: [],
     users: [],
+    agent_users: [],
+    users_configured: false,
+    user_domains: [],
+    user_domains_configured: false,
+    plugins: { installations: [] },
+    plugins_configured: false,
     zero_trust_enabled: false,
+    cas_enabled: false,
     agent_config: cloneDefaultAgentConfig(),
     last_pulled: new Date(),
   };
@@ -498,12 +698,158 @@ function asRecord(value: unknown): PlainRecord {
     : {};
 }
 
+function isPlainRecord(value: unknown): value is PlainRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
+}
+
 function records(value: unknown): PlainRecord[] {
   return Array.isArray(value) ? value.map(asRecord) : [];
 }
 
 function textValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function safePluginText(value: unknown, maximumBytes: number, expression: RegExp): string {
+  const text = textValue(value);
+  if (!text || Buffer.byteLength(text, "utf8") > maximumBytes || !expression.test(text)) return "";
+  // These values are identifiers, not paths. Refusing traversal-like segments
+  // here keeps a later agent implementation from accidentally treating them as
+  // filesystem input.
+  return text.includes("..") || text.includes("//") ? "" : text;
+}
+
+function normalizePluginConfigValue(value: unknown, depth: number): unknown | undefined {
+  if (depth > MAX_PLUGIN_CONFIG_DEPTH) return undefined;
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string") {
+    return Buffer.byteLength(value, "utf8") <= MAX_PLUGIN_CONFIG_STRING_BYTES ? value : undefined;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > MAX_PLUGIN_CONFIG_COLLECTION_LENGTH) return undefined;
+    const normalized: unknown[] = [];
+    for (const item of value) {
+      const result = normalizePluginConfigValue(item, depth + 1);
+      if (result === undefined) return undefined;
+      normalized.push(result);
+    }
+    return normalized;
+  }
+  if (!isPlainRecord(value)) return undefined;
+
+  const entries = Object.entries(value);
+  if (entries.length > MAX_PLUGIN_CONFIG_COLLECTION_LENGTH) return undefined;
+  const normalized: PlainRecord = {};
+  for (const [key, item] of entries.sort(([left], [right]) => left.localeCompare(right))) {
+    if (
+      Buffer.byteLength(key, "utf8") > MAX_PLUGIN_CONFIG_KEY_LENGTH ||
+      !PLUGIN_CONFIG_KEY.test(key) ||
+      key === "__proto__" || key === "constructor" || key === "prototype"
+    ) {
+      return undefined;
+    }
+    const result = normalizePluginConfigValue(item, depth + 1);
+    if (result === undefined) return undefined;
+    normalized[key] = result;
+  }
+  return normalized;
+}
+
+function normalizePluginConfig(value: unknown): Record<string, unknown> | null {
+  if (value === undefined || value === null) return {};
+  if (!isPlainRecord(value)) return null;
+  try {
+    const normalized = normalizePluginConfigValue(value, 0);
+    if (!isPlainRecord(normalized)) return null;
+    const serialized = JSON.stringify(normalized);
+    if (Buffer.byteLength(serialized, "utf8") > MAX_PLUGIN_CONFIG_BYTES) return null;
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Normalize the execution-free plugin deployment plan before it is published
+ * to agents. Artifacts, source code, publisher data, and credentials remain
+ * control-plane concerns and are intentionally not part of this snapshot.
+ */
+export function normalizePluginsConfig(value: unknown): PluginsConfig {
+  const raw = isPlainRecord(value) ? value : {};
+  const candidates: Array<PluginInstallation & { config_bytes: number }> = [];
+  const rawInstallations = Array.isArray(raw.installations) ? raw.installations : [];
+
+  // A bounded scan prevents an oversized MongoDB document from turning polling
+  // into unbounded work. Sorting valid candidates below makes the published
+  // snapshot stable even when Mongo preserves a different insertion order.
+  for (const value of rawInstallations.slice(0, MAX_PLUGIN_INSTALLATIONS * 4)) {
+    if (!isPlainRecord(value)) continue;
+    const pluginID = safePluginText(value.plugin_id, MAX_PLUGIN_IDENTIFIER_LENGTH, PLUGIN_IDENTIFIER);
+    const factoryID = safePluginText(value.factory_id, MAX_PLUGIN_IDENTIFIER_LENGTH, PLUGIN_FACTORY_IDENTIFIER);
+    const version = safePluginText(value.version, MAX_PLUGIN_VERSION_LENGTH, PLUGIN_OPAQUE_VERSION);
+    const apiVersion = safePluginText(value.api_version, MAX_PLUGIN_API_VERSION_LENGTH, PLUGIN_API_VERSION);
+    const sha256 = textValue(value.sha256).toLowerCase();
+    if (!pluginID || !factoryID || !version || !apiVersion || !PLUGIN_SHA256.test(sha256)) continue;
+
+    const config = normalizePluginConfig(value.config);
+    if (config === null) continue;
+    const configBytes = Buffer.byteLength(JSON.stringify(config), "utf8");
+
+    const granted = new Set<string>();
+    for (const capability of Array.isArray(value.granted_capabilities)
+      ? value.granted_capabilities.slice(0, PLUGIN_CAPABILITIES.size * 4)
+      : []) {
+      if (typeof capability === "string" && PLUGIN_CAPABILITIES.has(capability)) {
+        granted.add(capability);
+      }
+    }
+    candidates.push({
+      plugin_id: pluginID,
+      factory_id: factoryID,
+      version,
+      sha256,
+      api_version: apiVersion,
+      granted_capabilities: [...granted].sort(),
+      config,
+      config_bytes: configBytes,
+    });
+  }
+
+  candidates.sort((left, right) =>
+    left.plugin_id.localeCompare(right.plugin_id) ||
+    left.factory_id.localeCompare(right.factory_id) ||
+    left.version.localeCompare(right.version) ||
+    left.sha256.localeCompare(right.sha256),
+  );
+
+  const pluginIDCounts = new Map<string, number>();
+  const factoryIDCounts = new Map<string, number>();
+  for (const candidate of candidates) {
+    pluginIDCounts.set(candidate.plugin_id, (pluginIDCounts.get(candidate.plugin_id) || 0) + 1);
+    factoryIDCounts.set(candidate.factory_id, (factoryIDCounts.get(candidate.factory_id) || 0) + 1);
+  }
+
+  const installations: PluginInstallation[] = [];
+  let totalConfigBytes = 0;
+  for (const candidate of candidates) {
+    if (installations.length >= MAX_PLUGIN_INSTALLATIONS) break;
+    // A deployment must have an unambiguous identity. Dropping every member of
+    // a duplicate pair is safer than letting insertion order choose a plugin.
+    if (pluginIDCounts.get(candidate.plugin_id) !== 1 || factoryIDCounts.get(candidate.factory_id) !== 1) continue;
+    if (totalConfigBytes + candidate.config_bytes > MAX_TOTAL_PLUGIN_CONFIG_BYTES) continue;
+    totalConfigBytes += candidate.config_bytes;
+    const { config_bytes: _configBytes, ...installation } = candidate;
+    installations.push(installation);
+  }
+
+  return { installations };
 }
 
 function idValue(value: unknown, fallback = ""): string {
@@ -528,72 +874,154 @@ function uniqueTargets(value: unknown, primary = ""): string[] {
   return result;
 }
 
-function optionalBool(value: unknown): boolean | undefined {
+function optionalBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-function optionalBoundedInt(value: unknown, min: number, max: number): number | undefined {
-  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
-  if (!Number.isInteger(n) || n < min || n > max) return undefined;
-  return n;
+function optionalBoundedInteger(value: unknown, min: number, max: number): number | undefined {
+  const number = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(number) || number < min || number > max) return undefined;
+  return number;
 }
 
-function optionalKeyMode(value: unknown): AgentKeyMode | undefined {
+function routeKeyMode(value: unknown): RouteKeyMode | undefined {
   return value === "ip" || value === "host" || value === "route" || value === "global"
     ? value
     : undefined;
 }
 
-function definedEntries<T extends Record<string, unknown>>(value: T): T | undefined {
-  const entries = Object.entries(value).filter(([, entry]) => entry !== undefined);
-  if (entries.length === 0) return undefined;
-  return Object.fromEntries(entries) as T;
-}
-
-/**
- * Maps Mongo `route_policy` (or seed/agent `policy`) onto the Go agent contract.
- * Unknown keys are dropped. Invalid bandwidth keys and out-of-range numbers are
- * dropped (not clamped) so `policy.RoutePolicy.Validate()` cannot reject the
- * whole snapshot. Empty objects are omitted.
- */
-export function normalizeRoutePolicy(input: unknown): RoutePolicy | undefined {
-  if (input === null || input === undefined || typeof input !== "object" || Array.isArray(input)) {
-    return undefined;
-  }
-  const raw = input as PlainRecord;
+// normalizeRoutePolicy intentionally preserves absence: omitted policy fields
+// inherit the agent default, while explicit false disables a route feature.
+export function normalizeRoutePolicy(value: unknown): RoutePolicy | undefined {
+  const raw = asRecord(value);
+  const cacheRaw = asRecord(raw.cache);
+  const bandwidthRaw = asRecord(raw.bandwidth);
   const policy: RoutePolicy = {};
 
-  if (raw.cache !== null && typeof raw.cache === "object" && !Array.isArray(raw.cache)) {
-    const cacheRaw = raw.cache as PlainRecord;
-    const cache = definedEntries({
-      enabled: optionalBool(cacheRaw.enabled),
-      ttl_seconds: optionalBoundedInt(cacheRaw.ttl_seconds, 1, 86400),
-      max_entries: optionalBoundedInt(cacheRaw.max_entries, 1, 100000),
-      max_body_bytes: optionalBoundedInt(cacheRaw.max_body_bytes, 1024, 104857600),
-    });
-    if (cache) policy.cache = cache;
+  const cache = {
+    enabled: optionalBoolean(cacheRaw.enabled),
+    ttl_seconds: optionalBoundedInteger(cacheRaw.ttl_seconds, 1, 86400),
+    max_entries: optionalBoundedInteger(cacheRaw.max_entries, 1, 100000),
+    max_body_bytes: optionalBoundedInteger(cacheRaw.max_body_bytes, 1024, 104857600),
+  };
+  if (Object.values(cache).some((entry) => entry !== undefined)) {
+    policy.cache = cache;
   }
 
-  if (raw.bandwidth !== null && typeof raw.bandwidth === "object" && !Array.isArray(raw.bandwidth)) {
-    const bandwidthRaw = raw.bandwidth as PlainRecord;
-    const bandwidth = definedEntries({
-      enabled: optionalBool(bandwidthRaw.enabled),
-      bytes_per_second: optionalBoundedInt(bandwidthRaw.bytes_per_second, 1024, 10737418240),
-      burst_bytes: optionalBoundedInt(bandwidthRaw.burst_bytes, 1024, 10737418240),
-      key: optionalKeyMode(bandwidthRaw.key),
-    });
-    if (bandwidth) policy.bandwidth = bandwidth;
+  const bandwidth = {
+    enabled: optionalBoolean(bandwidthRaw.enabled),
+    bytes_per_second: optionalBoundedInteger(bandwidthRaw.bytes_per_second, 1024, 10737418240),
+    burst_bytes: optionalBoundedInteger(bandwidthRaw.burst_bytes, 1024, 10737418240),
+    key: routeKeyMode(bandwidthRaw.key),
+  };
+  if (Object.values(bandwidth).some((entry) => entry !== undefined)) {
+    policy.bandwidth = bandwidth;
   }
 
-  return policy.cache || policy.bandwidth ? policy : undefined;
+  return policy.cache || policy.bandwidth || policy.access ? policy : undefined;
 }
 
-function routePolicyFromDoc(doc: PlainRecord): RoutePolicy | undefined {
-  return normalizeRoutePolicy(doc.route_policy ?? doc.policy);
+const MAX_ACCESS_CIDRS = 64;
+
+function parseAccessCidr(value: string): string | null {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) return null;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(trimmed)) {
+    const octets = trimmed.split(".").map((part) => Number(part));
+    if (octets.every((octet) => Number.isInteger(octet) && octet >= 0 && octet <= 255)) {
+      return `${trimmed}/32`;
+    }
+    return null;
+  }
+  const slash = trimmed.lastIndexOf("/");
+  if (slash <= 0) {
+    if (trimmed.includes(":")) return `${trimmed}/128`;
+    return null;
+  }
+  const address = trimmed.slice(0, slash);
+  const prefix = Number(trimmed.slice(slash + 1));
+  if (!Number.isInteger(prefix)) return null;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(address)) {
+    if (prefix < 0 || prefix > 32) return null;
+    return `${address}/${prefix}`;
+  }
+  if (address.includes(":") && prefix >= 0 && prefix <= 128) {
+    return `${address}/${prefix}`;
+  }
+  return null;
+}
+
+function normalizeAccessControl(value: unknown, allowInherit = false): { mode: string; cidrs: string[] } | undefined {
+  const raw = asRecord(value);
+  const mode = textValue(raw.mode).toLowerCase();
+  const allowed = allowInherit
+    ? new Set(["off", "allowlist", "blocklist", "inherit"])
+    : new Set(["off", "allowlist", "blocklist"]);
+  if (!allowed.has(mode) && mode !== "") return undefined;
+  const cidrs: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of Array.isArray(raw.cidrs) ? raw.cidrs : []) {
+    const parsed = parseAccessCidr(textValue(entry));
+    if (!parsed || seen.has(parsed)) continue;
+    seen.add(parsed);
+    cidrs.push(parsed);
+    if (cidrs.length > MAX_ACCESS_CIDRS) return undefined;
+  }
+  const resolvedMode = allowed.has(mode) ? mode : allowInherit ? "inherit" : "off";
+  if ((resolvedMode === "allowlist" || resolvedMode === "blocklist") && cidrs.length === 0) {
+    return undefined;
+  }
+  return { mode: resolvedMode, cidrs };
+}
+
+function publishedAccess(domainAccess: { mode: string; cidrs: string[] } | undefined, subdomainAccess?: { mode: string; cidrs: string[] }): RouteAccess | undefined {
+  const selected = !subdomainAccess || subdomainAccess.mode === "inherit" ? domainAccess : subdomainAccess;
+  if (!selected || selected.mode === "off" || selected.mode === "inherit") return undefined;
+  if (selected.mode !== "allowlist" && selected.mode !== "blocklist") return undefined;
+  return { mode: selected.mode, cidrs: [...selected.cidrs] };
+}
+
+function withAccess(policy: RoutePolicy | undefined, access: RouteAccess | undefined): RoutePolicy | undefined {
+  if (!access) return policy;
+  return { ...(policy || {}), access };
 }
 
 /** Converts projected MongoDB documents into the public, agent-facing snapshot. */
 export function buildCachedState(documents: MongoStateDocuments): CachedState {
+  const users: User[] = [];
+  const agentUsers: AgentUser[] = [];
+  const agentUsersByID = new Map<string, AgentUser>();
+  let hasUnsyncableUser = false;
+  for (const rawUser of documents.userDocs) {
+    const doc = asRecord(rawUser);
+    if (doc.banned === true) continue;
+    const email = textValue(doc.email).toLowerCase();
+    const username = textValue(doc.name) || textValue(doc.username) || email.split("@")[0] || "";
+    if (!username) continue;
+    const id = idValue(doc._id, idValue(doc.id, username));
+    users.push({
+      id,
+      username,
+      email,
+      role: textValue(doc.role) || "user",
+    });
+
+    const passwordHash = textValue(doc.password_hash) || textValue(doc.passwordHash);
+    if (!passwordHash) {
+      hasUnsyncableUser = true;
+      continue;
+    }
+    const agentUser: AgentUser = {
+      id,
+      username,
+      email,
+      password_hash: passwordHash,
+      zero_trust_enabled: doc.zero_trust_enabled !== false && doc.zeroTrustEnabled !== false,
+    };
+    agentUsers.push(agentUser);
+    agentUsersByID.set(id, agentUser);
+  }
+
   const hostsByScope = new Map<string, string[]>();
   for (const rawDomain of documents.domainDocs) {
     const doc = asRecord(rawDomain);
@@ -635,6 +1063,8 @@ export function buildCachedState(documents: MongoStateDocuments): CachedState {
 
   const domains: Domain[] = [];
   const wafRules: WafRule[] = [];
+  const userDomains: UserDomain[] = [];
+  let hasUnsyncableUserDomain = false;
   for (const rawDomain of documents.domainDocs) {
     const doc = asRecord(rawDomain);
     if (doc.active === false) continue;
@@ -643,7 +1073,24 @@ export function buildCachedState(documents: MongoStateDocuments): CachedState {
     const domainId = idValue(doc._id, idValue(doc.id, domain));
     const targetUrl = textValue(doc.target_url);
     const targetUrls = uniqueTargets(upstreamsByRoute.get(routeKey(domainId, "")), targetUrl);
+    const ownerID = idValue(doc.user_id);
+    if (ownerID) {
+      const owner = agentUsersByID.get(ownerID);
+      if (!owner) {
+        hasUnsyncableUserDomain = true;
+      } else {
+        userDomains.push({
+          id: domainId,
+          user_id: ownerID,
+          username: owner.username,
+          domain,
+          target_url: targetUrl,
+          active: true,
+        });
+      }
+    }
 
+    const domainAccess = normalizeAccessControl(doc.access_control);
     const subdomains: Subdomain[] = [];
     for (const rawSubdomain of records(doc.subdomains)) {
       if (rawSubdomain.active === false) continue;
@@ -652,15 +1099,23 @@ export function buildCachedState(documents: MongoStateDocuments): CachedState {
         .toLowerCase();
       if (!fullDomain) continue;
       const subdomainTarget = textValue(rawSubdomain.target_url);
+      const subdomainId = idValue(rawSubdomain._id, idValue(rawSubdomain.id, fullDomain));
+      const subdomainAccess = normalizeAccessControl(rawSubdomain.access_control, true);
       subdomains.push({
-        id: idValue(rawSubdomain._id, idValue(rawSubdomain.id, fullDomain)),
+        id: subdomainId,
         subdomain,
         full_domain: fullDomain,
         target_url: subdomainTarget,
         target_urls: uniqueTargets(upstreamsByRoute.get(routeKey(domainId, subdomain)), subdomainTarget),
-        policy: routePolicyFromDoc(rawSubdomain),
+        certificate_pem: textValue(rawSubdomain.certificate_pem) || undefined,
+        private_key_pem: textValue(rawSubdomain.private_key_pem) || undefined,
+        policy: withAccess(normalizeRoutePolicy(rawSubdomain.route_policy), publishedAccess(domainAccess, subdomainAccess)),
         active: true,
       });
+      for (const rule of records(rawSubdomain.waf_rules)) {
+        const normalized = normalizeWafRule(rule, subdomainId, [fullDomain]);
+        if (normalized) wafRules.push(normalized);
+      }
     }
 
     domains.push({
@@ -670,8 +1125,8 @@ export function buildCachedState(documents: MongoStateDocuments): CachedState {
       target_urls: targetUrls,
       certificate_pem: textValue(doc.certificate_pem),
       private_key_pem: textValue(doc.private_key_pem),
-      policy: routePolicyFromDoc(doc),
       team_id: idValue(doc.team_id),
+      policy: withAccess(normalizeRoutePolicy(doc.route_policy), publishedAccess(domainAccess)),
       active: true,
       subdomains,
     });
@@ -690,21 +1145,6 @@ export function buildCachedState(documents: MongoStateDocuments): CachedState {
   }
   wafRules.sort((left, right) => right.priority - left.priority || left.name.localeCompare(right.name));
 
-  const users: User[] = [];
-  for (const rawUser of documents.userDocs) {
-    const doc = asRecord(rawUser);
-    if (doc.banned === true) continue;
-    const email = textValue(doc.email).toLowerCase();
-    const username = textValue(doc.name) || textValue(doc.username) || email.split("@")[0] || "";
-    if (!username) continue;
-    users.push({
-      id: idValue(doc._id, idValue(doc.id, username)),
-      username,
-      email,
-      role: textValue(doc.role) || "user",
-    });
-  }
-
   const settings = asRecord(documents.settingsDoc);
   const legacyZeroTrust = asRecord(documents.legacyZeroTrustDoc).value;
   const zeroTrustEnabled = typeof settings.zeroTrustEnabled === "boolean"
@@ -715,7 +1155,19 @@ export function buildCachedState(documents: MongoStateDocuments): CachedState {
     domains,
     waf_rules: wafRules,
     users,
+    agent_users: agentUsers,
+    // A full replacement is intentionally opt-in. A populated list without the
+    // flag remains useful to older agents as an incremental update, but cannot
+    // erase a local/offline agent's accounts.
+    users_configured: settings.agentUsersConfigured === true && !hasUnsyncableUser,
+    user_domains: userDomains,
+    user_domains_configured: settings.agentUserDomainsConfigured === true && !hasUnsyncableUserDomain,
+    // Like users, plugin replacement is opt-in. An empty but configured plan
+    // is meaningful: it tells an agent to remove its prior global installs.
+    plugins: normalizePluginsConfig(settings.plugins),
+    plugins_configured: settings.pluginsConfigured === true,
     zero_trust_enabled: zeroTrustEnabled,
+    cas_enabled: settings.casEnabled === true,
     agent_config: normalizeAgentConfig(settings.agentConfig),
     last_pulled: new Date(),
   };
@@ -748,7 +1200,7 @@ async function pullFromMongo(): Promise<CachedState | null> {
     const [domainDocs, proxyConfigDocs, globalRuleDocs, userDocs, settingsDoc, legacyZeroTrustDoc] =
       await Promise.all([
         DomainModel.find({ active: { $ne: false } })
-          .select("_id domain target_url certificate_pem private_key_pem team_id active subdomains waf_rules route_policy")
+          .select("_id user_id domain target_url certificate_pem private_key_pem team_id active route_policy access_control subdomains waf_rules")
           .sort({ domain: 1 })
           .lean(),
         ProxyConfigModel.find({ enabled: { $ne: false } })
@@ -759,16 +1211,21 @@ async function pullFromMongo(): Promise<CachedState | null> {
           .sort({ priority: -1, name: 1 })
           .lean(),
         UserModel.find({ banned: { $ne: true } })
-          .select("_id name email role banned")
+          .select("_id name email role banned password_hash zero_trust_enabled")
           .sort({ name: 1, email: 1 })
           .lean(),
         SettingsModel.findOne({
           $or: [
             { agentConfig: { $exists: true } },
             { zeroTrustEnabled: { $exists: true } },
+            { casEnabled: { $exists: true } },
+            { agentUsersConfigured: { $exists: true } },
+            { agentUserDomainsConfigured: { $exists: true } },
+            { plugins: { $exists: true } },
+            { pluginsConfigured: { $exists: true } },
           ],
         })
-          .select("agentConfig zeroTrustEnabled updatedAt")
+          .select("agentConfig zeroTrustEnabled casEnabled agentUsersConfigured agentUserDomainsConfigured plugins pluginsConfigured updatedAt")
           .sort({ updatedAt: -1, _id: -1 })
           .lean(),
         SettingsModel.collection.findOne(
@@ -853,17 +1310,25 @@ function matchesKey(request: Request, configuredKeys: string[]): boolean {
   return presentedKeys.some((presented) => configuredKeys.some((configured) => safeEqual(presented, configured)));
 }
 
+// Read access is granted by the poll keys only. The config-write key is
+// deliberately excluded: /domains publishes TLS private keys and password
+// hashes, so a leaked write key must not also unlock that snapshot.
 function checkAuth(request: Request): boolean {
   const readKeys = [API_KEY, DIAMOND_KEY].filter(Boolean);
   if (readKeys.length === 0) {
-    return ALLOW_UNAUTHENTICATED || Boolean(CONFIG_WRITE_KEY && matchesKey(request, [CONFIG_WRITE_KEY]));
+    return ALLOW_UNAUTHENTICATED;
   }
-  const configuredKeys = CONFIG_WRITE_KEY ? [...readKeys, CONFIG_WRITE_KEY] : readKeys;
-  return matchesKey(request, configuredKeys);
+  return matchesKey(request, readKeys);
 }
 
+// Writes reconfigure every edge agent, so they always require the dedicated
+// write key. Without one configured the endpoint stays closed rather than
+// falling back to read credentials or to unauthenticated access.
 function checkWriteAuth(request: Request): boolean {
-  return CONFIG_WRITE_KEY ? matchesKey(request, [CONFIG_WRITE_KEY]) : checkAuth(request);
+  if (!CONFIG_WRITE_KEY) {
+    return false;
+  }
+  return matchesKey(request, [CONFIG_WRITE_KEY]);
 }
 
 function safeEqual(a: string, b: string): boolean {
@@ -962,6 +1427,92 @@ export async function readJSONBody(request: Request): Promise<unknown> {
   }
 }
 
+export function parseWafStatName(name: string): { name: string; hosts: string[] } {
+  const trimmed = name.trim();
+  // Parsed by hand rather than with /^(.*) \[([^\]]+)\]$/: that pattern
+  // backtracks over every " [" occurrence when the input does not match,
+  // which is quadratic on attacker-controlled rule names. lastIndexOf is
+  // linear and gives the same greedy "last bracket wins" result.
+  if (!trimmed.endsWith("]")) {
+    return { name: trimmed, hosts: [] };
+  }
+  const close = trimmed.length - 1;
+  const open = trimmed.lastIndexOf(" [", close);
+  if (open <= 0) {
+    return { name: trimmed, hosts: [] };
+  }
+  const base = trimmed.slice(0, open).trim();
+  const hostsPart = trimmed.slice(open + 2, close);
+  if (!base || !hostsPart || hostsPart.includes("]")) {
+    return { name: trimmed, hosts: [] };
+  }
+  const hosts = hostsPart
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
+  return { name: base, hosts };
+}
+
+export async function applyWafRuleStats(body: unknown): Promise<{ updated: number; persisted: boolean }> {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw new RequestError(400, "request body must be a JSON object");
+  }
+  const rules = (body as { rules?: unknown }).rules;
+  if (!Array.isArray(rules)) {
+    throw new RequestError(400, "rules must be an array");
+  }
+  if (!connected) {
+    return { updated: 0, persisted: false };
+  }
+  let updated = 0;
+  for (const raw of rules.slice(0, 256)) {
+    const record = asRecord(raw);
+    const parsed = parseWafStatName(textValue(record.name));
+    if (!parsed.name) continue;
+    const avgNs = Math.max(0, Math.min(1_000_000_000, Math.trunc(Number(record.avg_ns) || 0)));
+    const samples = Math.max(0, Math.min(1_000_000_000, Math.trunc(Number(record.samples) || 0)));
+    if (samples <= 0) continue;
+    const setDomain = {
+      "waf_rules.$[r].avg_eval_ns": avgNs,
+      "waf_rules.$[r].eval_samples": samples,
+    };
+    const domainFilter = [{ "r.name": parsed.name }];
+    if (parsed.hosts.length === 1) {
+      const host = parsed.hosts[0];
+      const sub = await DomainModel.updateOne(
+        { "subdomains.full_domain": host },
+        {
+          $set: {
+            "subdomains.$[s].waf_rules.$[r].avg_eval_ns": avgNs,
+            "subdomains.$[s].waf_rules.$[r].eval_samples": samples,
+          },
+        },
+        { arrayFilters: [{ "s.full_domain": host }, { "r.name": parsed.name }] }
+      );
+      if ((sub.matchedCount || 0) > 0) {
+        updated += 1;
+        continue;
+      }
+      const apex = await DomainModel.updateOne(
+        { domain: host },
+        { $set: setDomain },
+        { arrayFilters: domainFilter }
+      );
+      if ((apex.matchedCount || 0) > 0) updated += 1;
+      continue;
+    }
+    if (parsed.hosts.length > 1) {
+      const apex = await DomainModel.updateOne(
+        { domain: parsed.hosts[0] },
+        { $set: setDomain },
+        { arrayFilters: domainFilter }
+      );
+      if ((apex.matchedCount || 0) > 0) updated += 1;
+    }
+  }
+  return { updated, persisted: true };
+}
+
 async function saveAgentConfig(agentConfig: AgentConfig): Promise<boolean> {
   let persisted = false;
   if (connected) {
@@ -1001,9 +1552,10 @@ async function routeRequest(request: Request): Promise<Response> {
         domains_cached: cachedState.domains.length,
         rules_cached: cachedState.waf_rules.length,
         users_cached: cachedState.users.length,
+        cas_enabled: cachedState.cas_enabled,
         agent_config_cached: true,
         auth_required: Boolean(API_KEY || DIAMOND_KEY) || !ALLOW_UNAUTHENTICATED,
-        config_write_key_configured: Boolean(CONFIG_WRITE_KEY),
+        config_write_enabled: Boolean(CONFIG_WRITE_KEY),
         last_pulled: cachedState.last_pulled.toISOString(),
       });
     }
@@ -1052,6 +1604,23 @@ async function routeRequest(request: Request): Promise<Response> {
       return jsonBodyResponse(cachedResponseBodies.users);
     }
 
+    case "/waf-stats": {
+      if (request.method !== "POST") {
+        return methodNotAllowed(["POST"]);
+      }
+      try {
+        const parsedBody = await readJSONBody(request);
+        const result = await applyWafRuleStats(parsedBody);
+        return jsonResponse(result);
+      } catch (error) {
+        if (error instanceof RequestError) {
+          return jsonResponse({ error: error.publicMessage }, error.status);
+        }
+        LOG.error(`Failed to store WAF stats: ${errorMessage(error)}`);
+        return jsonResponse({ error: "waf stats unavailable" }, 503);
+      }
+    }
+
     default:
       return jsonResponse({ error: "not found" }, 404);
   }
@@ -1088,9 +1657,9 @@ async function main() {
 
   LOG.info(`Stream server listening on http://${HOST}:${PORT}`);
   LOG.info(`MongoDB: ${redactMongoUri(MONGODB_URI)}  Poll: ${POLL_INTERVAL}ms`);
-  LOG.info(`Endpoints: GET /health  GET /domains  GET /users  GET/PUT /agent-config`);
+  LOG.info(`Endpoints: GET /health  GET /domains  GET /users  GET/PUT /agent-config  POST /waf-stats`);
   LOG.info(`API auth: ${API_KEY || DIAMOND_KEY ? "configured" : ALLOW_UNAUTHENTICATED ? "disabled by ALLOW_UNAUTHENTICATED" : "required but missing keys"}`);
-  LOG.info(`Config write key: ${CONFIG_WRITE_KEY ? "configured" : "using API auth"}`);
+  LOG.info(`Config write key: ${CONFIG_WRITE_KEY ? "configured" : "not set — PUT /agent-config is disabled"}`);
   LOG.info(`Seed file: ${SEED_FILE}  (${cachedState.domains.length} domains, ${cachedState.waf_rules.length} rules)`);
 }
 

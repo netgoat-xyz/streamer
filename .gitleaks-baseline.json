@@ -1,0 +1,23 @@
+[
+ {
+  "RuleID": "private-key",
+  "Description": "Identified a Private Key, which may compromise cryptographic security and sensitive data encryption.",
+  "StartLine": 195,
+  "EndLine": 207,
+  "StartColumn": 28,
+  "EndColumn": 56,
+  "Match": "REDACTED",
+  "Secret": "REDACTED",
+  "File": "server.test.ts",
+  "SymlinkFile": "",
+  "Commit": "f04bb5ac44e3d21486976ba27f65d80aebf92e70",
+  "Link": "https://github.com/netgoat-xyz/streamer/blob/f04bb5ac44e3d21486976ba27f65d80aebf92e70/server.test.ts#L195-L207",
+  "Entropy": 4.764223,
+  "Author": "Cursor Agent",
+  "Email": "cursoragent@cursor.com",
+  "Date": "2026-09-04T20:29:23Z",
+  "Message": "fix(stream): emit route policy and certs to agent domains\n\nPublish Mongo route_policy as agent-facing policy on /domains so dashboard\ncache/bandwidth settings reach the NetGoat agent without YAML. Keep TLS PEMs\nand existing WAF snapshot behavior.\n\nCo-authored-by: duckeydev \u003cduckeydev@gmail.com\u003e",
+  "Tags": [],
+  "Fingerprint": "f04bb5ac44e3d21486976ba27f65d80aebf92e70:server.test.ts:private-key:195"
+ }
+]

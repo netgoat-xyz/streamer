@@ -1,11 +1,22 @@
 import mongoose from "mongoose";
 
+const AccessControlSchema = new mongoose.Schema({
+  mode: {
+    type: String,
+    enum: ['off', 'allowlist', 'blocklist', 'inherit'],
+    default: 'off'
+  },
+  cidrs: [{ type: String }]
+}, { _id: false });
+
 const SubdomainWAFRuleSchema = new mongoose.Schema({
   name: { type: String, required: true },
   expression: { type: String, required: true },
   action: { type: String, enum: ['BLOCK', 'ALLOW', 'LOG'], default: 'BLOCK' },
   priority: { type: Number, default: 0 },
   enabled: { type: Boolean, default: true },
+  avg_eval_ns: { type: Number, default: 0 },
+  eval_samples: { type: Number, default: 0 },
   created_at: { type: Date, default: Date.now },
   updated_at: { type: Date, default: Date.now }
 });
@@ -17,12 +28,18 @@ const SubdomainSchema = new mongoose.Schema({
   active: { type: Boolean, default: true },
   certificate_pem: String,
   private_key_pem: String,
-  // Optional route-scoped cache and bandwidth policy. Omitted values inherit
-  // the agent defaults and are published as agent-facing `policy`.
+  // Explicit agent-facing overrides. Omitted fields inherit the global agent
+  // configuration; this is intentionally separate from legacy dashboard
+  // display settings.
   route_policy: { type: mongoose.Schema.Types.Mixed },
-
+  
   // Subdomain-specific WAF rules
   waf_rules: [SubdomainWAFRuleSchema],
+
+  access_control: {
+    type: AccessControlSchema,
+    default: () => ({ mode: 'inherit', cidrs: [] })
+  },
   
   // Stats
   request_count: { type: Number, default: 0 },
@@ -40,6 +57,8 @@ const DomainWAFRuleSchema = new mongoose.Schema({
   priority: { type: Number, default: 0 },
   enabled: { type: Boolean, default: true },
   description: String,
+  avg_eval_ns: { type: Number, default: 0 },
+  eval_samples: { type: Number, default: 0 },
   created_at: { type: Date, default: Date.now },
   updated_at: { type: Date, default: Date.now }
 });
@@ -59,8 +78,13 @@ const DomainSchema = new mongoose.Schema({
   ssl_enabled: { type: Boolean, default: false },
   auto_ssl: { type: Boolean, default: false },
 
-  // Optional route-scoped cache and bandwidth policy published to agents as `policy`.
+  // Optional route-scoped cache and bandwidth policy published to agents.
   route_policy: { type: mongoose.Schema.Types.Mixed },
+
+  access_control: {
+    type: AccessControlSchema,
+    default: () => ({ mode: 'off', cidrs: [] })
+  },
   
   // Status
   active: { type: Boolean, default: true },

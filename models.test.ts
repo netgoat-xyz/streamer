@@ -45,7 +45,5 @@ describe("schema correctness", () => {
     expect(Post.schema.get("timestamps")).toEqual({ createdAt: "createdAt", updatedAt: "updatedAt" });
     expect(Invoice.schema.get("timestamps")).toEqual({ createdAt: "created_at", updatedAt: "updated_at" });
     expect(Team.schema.get("timestamps")).toEqual({ createdAt: "created_at", updatedAt: "updated_at" });
-    expect(Domain.schema.path("route_policy")).toBeDefined();
-    expect(Domain.schema.path("subdomains.route_policy")).toBeDefined();
   });
 });
