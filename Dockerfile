@@ -9,7 +9,7 @@ COPY server.ts ./
 COPY models ./models
 RUN bun build --compile --minify --sourcemap=none server.ts --outfile /out/stream-server
 
-FROM alpine:3.21
+FROM alpine:3.24
 LABEL org.opencontainers.image.description="Minimal hardened NetGoat stream server runtime" \
       org.opencontainers.image.base.name="alpine:3.21"
 RUN apk add --no-cache ca-certificates libstdc++ libgcc \
