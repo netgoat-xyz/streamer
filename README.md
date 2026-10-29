@@ -176,6 +176,19 @@ The image compiles the server to a single static binary with `bun build
 --compile`, runs on Alpine 3.21 as UID 10001, and healthchecks `/health`.
 Published images: `ghcr.io/netgoat-xyz/streamer`.
 
+The healthcheck sends whichever read key is configured (`API_KEY`, falling
+back to `DIAMOND_KEY`) and follows `PORT`, so a container with a custom port
+or only the legacy key still reports healthy.
+
+When MongoDB is unreachable the server serves `SEED_FILE` instead of live
+state. The default path is baked in but the file is not — mount it read-only
+if you rely on the fallback:
+
+```bash
+docker run --rm -p 8787:8787 --env-file .env \
+  -v "$PWD/seed-data.json:/app/seed-data.json:ro" netgoat-streamer
+```
+
 ## Deployment
 
 Run one or more replicas behind a load balancer. Each replica keeps its own

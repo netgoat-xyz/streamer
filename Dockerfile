@@ -23,5 +23,5 @@ ENV HOST=0.0.0.0 \
     PORT=8787 \
     SEED_FILE=/app/seed-data.json \
     LOG_LEVEL=info
-HEALTHCHECK --interval=10s --timeout=3s --retries=10 --start-period=15s CMD wget -qO- --header="X-API-Key: ${API_KEY:-}" http://127.0.0.1:8787/health >/dev/null || exit 1
+HEALTHCHECK --interval=10s --timeout=3s --retries=10 --start-period=15s CMD wget -qO- --header="X-API-Key: ${API_KEY:-${DIAMOND_KEY:-}}" "http://127.0.0.1:${PORT:-8787}/health" >/dev/null || exit 1
 ENTRYPOINT ["/app/stream-server"]
