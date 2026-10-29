@@ -76,6 +76,7 @@ to downstream consumers.
 | `API_KEY` | empty | Read key (`X-API-Key` / `Authorization: Bearer`) |
 | `DIAMOND_KEY` | empty | Additional read key (`X-Diamond-Key`) |
 | `CONFIG_WRITE_KEY` | empty | Required for `PUT /agent-config` when set |
+| `DNS_READ_KEY` | empty | Dedicated key for the sanitized `/dns/zones` snapshot |
 | `ALLOW_UNAUTHENTICATED` | `false` | Serve reads without a key |
 | `CAS_ENABLED` | `false` | Advertise CAS to clients in snapshots |
 | `SEED_FILE` | `./seed-data.json` | Local fallback snapshot |
@@ -91,6 +92,10 @@ Set `API_KEY`, `DIAMOND_KEY`, or both. Clients may authenticate with
 `X-Zero-Trust-Key` header. When no read key is configured, requests are denied
 unless `ALLOW_UNAUTHENTICATED=true` is explicitly set.
 
+The nameserver reads `/dns/zones` using `X-DNS-API-Key` and `DNS_READ_KEY`.
+That endpoint exposes only active zone names and active DNS records, and does
+not accept the broader agent snapshot credentials.
+
 `CONFIG_WRITE_KEY` is optional but recommended. When present, only that key can
 update `/agent-config`; send it in `X-Config-Write-Key` or a supported auth
 header. Without it, write access falls back to the normal API authentication.
@@ -104,6 +109,7 @@ header. Without it, write access falls back to the normal API authentication.
 | `GET` | `/users` | Active, non-banned control-plane users |
 | `GET` | `/agent-config` | Current normalized agent runtime settings |
 | `PUT` | `/agent-config` | Validate and update agent runtime settings |
+| `GET` | `/dns/zones` | Active DNS zones and records for the authoritative nameserver |
 | `GET` | `/waf-stats` | Aggregated WAF counters |
 | `GET` | `/__netgoat/metrics` | Prometheus-style metrics |
 

@@ -2,6 +2,7 @@
 import { timingSafeEqual } from "node:crypto";
 import mongoose from "mongoose";
 import DomainModel from "./models/Domain";
+import DNSRecordModel from "./models/DNSRecord";
 import ProxyConfigModel from "./models/ProxyConfig";
 import SettingsModel from "./models/Settings";
 import UserModel from "./models/User";
@@ -91,6 +92,20 @@ interface UserDomain {
   domain: string;
   target_url: string;
   active: boolean;
+}
+
+export interface DNSRecordSnapshot {
+  type: "A" | "AAAA" | "CNAME" | "MX" | "TXT" | "NS" | "SRV" | "CAA";
+  name: string;
+  value: string;
+  ttl: number;
+  priority?: number;
+  proxied: boolean;
+}
+
+export interface DNSZoneSnapshot {
+  name: string;
+  records: DNSRecordSnapshot[];
 }
 
 /**
@@ -202,6 +217,7 @@ export interface CachedState {
   zero_trust_enabled: boolean;
   cas_enabled: boolean;
   agent_config: AgentConfig;
+  dns_zones: DNSZoneSnapshot[];
   last_pulled: Date;
 }
 
@@ -218,6 +234,7 @@ const MONGODB_DB = process.env.MONGODB_DB || "netgoat";
 const API_KEY = process.env.API_KEY || "";
 const DIAMOND_KEY = process.env.DIAMOND_KEY || "";
 const CONFIG_WRITE_KEY = process.env.CONFIG_WRITE_KEY || "";
+const DNS_READ_KEY = process.env.DNS_READ_KEY || "";
 const ALLOW_UNAUTHENTICATED = process.env.ALLOW_UNAUTHENTICATED === "true";
 const POLL_INTERVAL = boundedInteger(process.env.POLL_INTERVAL, 5000, 250, 3600000);
 const MONGO_RETRY_INTERVAL = boundedInteger(process.env.MONGO_RETRY_INTERVAL, 10000, 1000, 3600000);
@@ -592,6 +609,7 @@ let cachedState: CachedState = {
   zero_trust_enabled: false,
   cas_enabled: false,
   agent_config: cloneDefaultAgentConfig(),
+  dns_zones: [],
   last_pulled: new Date(0),
 };
 
@@ -599,6 +617,7 @@ interface CachedResponseBodies {
   domains: string;
   users: string;
   agentConfig: string;
+  dnsZones: string;
 }
 
 export function serializeCachedResponses(state: CachedState): CachedResponseBodies {
@@ -619,6 +638,7 @@ export function serializeCachedResponses(state: CachedState): CachedResponseBodi
     domains: JSON.stringify(domains),
     users: JSON.stringify({ users: state.users }),
     agentConfig: JSON.stringify({ agent_config: state.agent_config }),
+    dnsZones: JSON.stringify({ zones: state.dns_zones, generated_at: state.last_pulled.toISOString() }),
   };
 }
 
@@ -656,6 +676,7 @@ async function loadSeedData(): Promise<CachedState> {
         plugins: parsed.plugins,
         pluginsConfigured: parsed.plugins_configured === true,
       },
+      dnsRecordDocs: Array.isArray(parsed.dns_records) ? parsed.dns_records : [],
     });
   } catch (err) {
     LOG.warn(`Failed to load seed file ${SEED_FILE}: ${errorMessage(err)}`);
@@ -677,6 +698,7 @@ function emptyState(): CachedState {
     zero_trust_enabled: false,
     cas_enabled: false,
     agent_config: cloneDefaultAgentConfig(),
+    dns_zones: [],
     last_pulled: new Date(),
   };
 }
@@ -688,6 +710,7 @@ interface MongoStateDocuments {
   proxyConfigDocs: readonly unknown[];
   globalRuleDocs: readonly unknown[];
   userDocs: readonly unknown[];
+  dnsRecordDocs?: readonly unknown[];
   settingsDoc: unknown;
   legacyZeroTrustDoc?: unknown;
 }
@@ -1169,8 +1192,70 @@ export function buildCachedState(documents: MongoStateDocuments): CachedState {
     zero_trust_enabled: zeroTrustEnabled,
     cas_enabled: settings.casEnabled === true,
     agent_config: normalizeAgentConfig(settings.agentConfig),
+    dns_zones: normalizeDNSZones(documents.domainDocs, documents.dnsRecordDocs ?? []),
     last_pulled: new Date(),
   };
+}
+
+const DNS_TYPES = new Set(["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA"]);
+const DNS_LABEL = /^(?!-)[a-z0-9_-]{1,63}(?<!-)$/i;
+
+function normalizeDNSName(value: unknown): string {
+  const name = textValue(value).toLowerCase().replace(/\.$/, "");
+  if (!name || name.length > 253 || name.includes("..")) return "";
+  return name.split(".").every((label) => DNS_LABEL.test(label)) ? name : "";
+}
+
+function normalizeDNSRecordName(value: unknown): string {
+  const name = textValue(value).toLowerCase();
+  if (name === "@") return name;
+  if (!name || name.length > 253 || name.includes("..")) return "";
+  return name.split(".").every((label) => DNS_LABEL.test(label)) ? name : "";
+}
+
+function normalizeDNSZones(domainDocs: readonly unknown[], dnsRecordDocs: readonly unknown[]): DNSZoneSnapshot[] {
+  const zones = new Map<string, DNSZoneSnapshot>();
+  const zoneNamesByID = new Map<string, string>();
+  for (const rawDomain of domainDocs) {
+    const domain = asRecord(rawDomain);
+    if (domain.active === false) continue;
+    const name = normalizeDNSName(domain.domain);
+    if (!name) continue;
+    const id = idValue(domain._id, idValue(domain.id, name));
+    zones.set(id, { name, records: [] });
+    zoneNamesByID.set(id, name);
+  }
+
+  for (const rawRecord of dnsRecordDocs.slice(0, 50000)) {
+    const record = asRecord(rawRecord);
+    if (record.active === false) continue;
+    const zoneID = idValue(record.domain_id);
+    const zone = zones.get(zoneID);
+    const type = textValue(record.type).toUpperCase();
+    const name = normalizeDNSRecordName(record.name);
+    const value = textValue(record.value);
+    if (!zone || !name || !value || Buffer.byteLength(value, "utf8") > 2048 || !DNS_TYPES.has(type)) continue;
+    if (normalizeDNSName(record.domain) !== zoneNamesByID.get(zoneID)) continue;
+    const ttl = optionalBoundedInteger(record.ttl, 60, 86400) ?? 3600;
+    const priority = optionalBoundedInteger(record.priority, 0, 65535);
+    zone.records.push({
+      type: type as DNSRecordSnapshot["type"],
+      name,
+      value,
+      ttl,
+      priority,
+      proxied: record.proxied === true,
+    });
+  }
+
+  return [...zones.values()]
+    .map((zone) => ({
+      ...zone,
+      records: zone.records.sort((left, right) =>
+        left.name.localeCompare(right.name) || left.type.localeCompare(right.type) || left.value.localeCompare(right.value),
+      ),
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function normalizeWafRule(rule: PlainRecord, scopeId: string, scopeHosts?: string[]): WafRule | null {
@@ -1197,7 +1282,7 @@ function normalizeWafRule(rule: PlainRecord, scopeId: string, scopeHosts?: strin
 
 async function pullFromMongo(): Promise<CachedState | null> {
   try {
-    const [domainDocs, proxyConfigDocs, globalRuleDocs, userDocs, settingsDoc, legacyZeroTrustDoc] =
+    const [domainDocs, proxyConfigDocs, globalRuleDocs, userDocs, dnsRecordDocs, settingsDoc, legacyZeroTrustDoc] =
       await Promise.all([
         DomainModel.find({ active: { $ne: false } })
           .select("_id user_id domain target_url certificate_pem private_key_pem team_id active route_policy access_control subdomains waf_rules")
@@ -1213,6 +1298,11 @@ async function pullFromMongo(): Promise<CachedState | null> {
         UserModel.find({ banned: { $ne: true } })
           .select("_id name email role banned password_hash zero_trust_enabled")
           .sort({ name: 1, email: 1 })
+          .lean(),
+        DNSRecordModel.find({ active: { $ne: false } })
+          .select("domain_id domain type name value ttl priority proxied active")
+          .sort({ domain: 1, name: 1, type: 1, value: 1 })
+          .limit(50000)
           .lean(),
         SettingsModel.findOne({
           $or: [
@@ -1239,12 +1329,13 @@ async function pullFromMongo(): Promise<CachedState | null> {
       proxyConfigDocs,
       globalRuleDocs,
       userDocs,
+      dnsRecordDocs,
       settingsDoc,
       legacyZeroTrustDoc,
     });
 
     LOG.info(
-      `Pulled from MongoDB: ${nextState.domains.length} domains, ${nextState.waf_rules.length} rules, ${nextState.users.length} users`
+      `Pulled from MongoDB: ${nextState.domains.length} domains, ${nextState.waf_rules.length} rules, ${nextState.users.length} users, ${nextState.dns_zones.length} DNS zones`
     );
     return nextState;
   } catch (err) {
@@ -1298,6 +1389,7 @@ function schedulePoll(delay: number): void {
 function requestKeys(request: Request): string[] {
   return [
     request.headers.get("X-API-Key") || "",
+    request.headers.get("X-DNS-API-Key") || "",
     (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, ""),
     request.headers.get("X-Diamond-Key") || "",
     request.headers.get("X-Zero-Trust-Key") || "",
@@ -1537,6 +1629,15 @@ async function routeRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/";
 
+  // DNS consumers receive only sanitized zone records, protected by a
+  // dedicated key rather than the broader agent snapshot credential.
+  if (path === "/dns/zones") {
+    if (request.method !== "GET") return methodNotAllowed(["GET"]);
+    if (!DNS_READ_KEY) return jsonResponse({ error: "DNS snapshot access is not configured" }, 503);
+    if (!matchesKey(request, [DNS_READ_KEY])) return unauthorized();
+    return jsonBodyResponse(cachedResponseBodies.dnsZones);
+  }
+
   if (!checkAuth(request)) return unauthorized();
 
   switch (path) {
@@ -1550,6 +1651,7 @@ async function routeRequest(request: Request): Promise<Response> {
         uptime: process.uptime(),
         mongo: connected,
         domains_cached: cachedState.domains.length,
+        dns_zones_cached: cachedState.dns_zones.length,
         rules_cached: cachedState.waf_rules.length,
         users_cached: cachedState.users.length,
         cas_enabled: cachedState.cas_enabled,
@@ -1657,7 +1759,7 @@ async function main() {
 
   LOG.info(`Stream server listening on http://${HOST}:${PORT}`);
   LOG.info(`MongoDB: ${redactMongoUri(MONGODB_URI)}  Poll: ${POLL_INTERVAL}ms`);
-  LOG.info(`Endpoints: GET /health  GET /domains  GET /users  GET/PUT /agent-config  POST /waf-stats`);
+  LOG.info(`Endpoints: GET /health  GET /domains  GET /users  GET /dns/zones  GET/PUT /agent-config  POST /waf-stats`);
   LOG.info(`API auth: ${API_KEY || DIAMOND_KEY ? "configured" : ALLOW_UNAUTHENTICATED ? "disabled by ALLOW_UNAUTHENTICATED" : "required but missing keys"}`);
   LOG.info(`Config write key: ${CONFIG_WRITE_KEY ? "configured" : "not set — PUT /agent-config is disabled"}`);
   LOG.info(`Seed file: ${SEED_FILE}  (${cachedState.domains.length} domains, ${cachedState.waf_rules.length} rules)`);
